@@ -1,0 +1,280 @@
+/*CODE IMPLEMENTED WITH FreeFem++ (documentation and free software available on https://freefem.org/)
+  4-STATE ACTIVE POTTS MODEL - BY M. MANGEAT & S. CHATTERJEE (2020)*/
+
+include "getARGV.idp" //Include parameters in command line.
+load "MUMPS" //Load a solver with less errors.
+
+//////////////////////////////
+/// PARAMETERS OF THE CODE ///
+//////////////////////////////
+
+//CPU clock time.
+real cpu=clock();
+
+//Physical parameters (beta=1/Temperature, rho0=N/V, epsilon= biased parameter, LX and LY=size of the box).
+real beta=getARGV("-beta",0.75);
+real rho0=getARGV("-rho0",1.33);
+real epsilon=getARGV("-epsilon",1.);
+real L=getARGV("-L",50);
+
+//Numerical parameters (dt=time increment, tmax=maximal time, N=number of verticles on the boundaries, init=geometry of initial condition, mode=initial value of rhog and rhol).
+real dt=getARGV("-dt",0.2);
+real tmax=getARGV("-tmax",1000);
+int N=getARGV("-N",100);
+int init=getARGV("-init",2); //0-> y-independent initial condition | 1-> x-independent initial condition | 2-> square of liquid inside the gas | 3-> quasi-vertical band | 4-> quasi-horizontal band.
+int mode=getARGV("-mode",1); //0-> linear stability (DRHO=0.02) | 1-> epsilon,rho0 diagram (const rhog,rhol) | 2-> T,rho0 diagram (non-const rhog,rhol).
+
+real D=1.,r=1., J=1.;
+real Dpara=D*(1+epsilon/3.);
+real Dperp=D*(1-epsilon/3.);
+real v=4*D*epsilon/3.;
+real LX=L, LY=L;
+real alpha=8*beta*J*beta*J*(1-2*beta*J/3.);
+
+//////////////////////////////
+/// CREATION OF THE DOMAIN ///
+//////////////////////////////
+
+int Nx=N, Ny=N;
+if (init==0)
+{
+	Ny=1;
+}
+else if (init==1)
+{
+	Nx=1;
+}
+
+//Definition of the mesh (centered in zero for convenience).
+mesh Th=square(Nx,Ny,[(-0.5+x)*LX,(-0.5+y)*LY]);
+fespace Vh(Th,P1,periodic=[[2,y],[4,y],[1,x],[3,x]]); //periodic boundary condition.
+cout << "---MESH CREATED--- -ctime=" << int(clock()-cpu) << "s" << endl;
+
+//Functions defined on the mesh.
+Vh rr,ru,rl,rd; //Unknown functions at step n+1.
+Vh RR,RU,RL,RD,R; //Unkown functions at step n.
+Vh vr,vu,vl,vd; //Test-functions at step n+1.
+Vh Irl, Iru, Ird, Ilu, Ild, Iud; //Flipping terms.
+Vh RPLOT; //Function to plot.
+
+//////////////////
+/// DATA FILES ///
+//////////////////
+
+func int dataFile(string name, real t)
+{
+	system("mkdir -p data_APM4_init"+init+"/");
+	ofstream fileR("data_APM4_init"+init+"/APM4_"+name+"_beta="+beta+"_rho0="+rho0+"_epsilon="+epsilon+"_L="+L+"_t="+t+".txt");
+	fileR.precision(6);
+	int Nexp=max(Nx,Ny);
+	Nexp=max(Nexp,200);
+	for (real Y=-LY/2.;Y<=LY/2.;Y+=LY/Nexp)
+	{
+		for (real X=-LX/2.;X<=LX/2.;X+=LX/Nexp)
+		{
+			fileR << RPLOT(X,Y) << " ";
+		}
+		fileR << endl;
+	}
+	return 1;
+}
+
+func int dataShapeX(real t)
+{
+	system("mkdir -p data_APM4_shapeX");
+	ofstream fileShapeX("data_APM4_shapeX/APM4_shapeX_beta="+beta+"_rho0="+rho0+"_epsilon="+epsilon+"_L="+L+"_t="+t+".txt");
+	fileShapeX.precision(6);
+	int Nexp=Nx;
+	for (real X=-LX/2.;X<LX/2.+LX/Nexp;X+=LX/Nexp)
+	{
+		fileShapeX << X << " " << R(X,0.) << " " << RR(X,0.) << " " << RL(X,0.) << " " << RU(X,0.) << " " << RD(X,0.) << endl;
+	}
+	return 1;
+}
+
+func int dataShapeY(real t)
+{
+	system("mkdir -p data_APM4_shapeY");
+	ofstream fileShapeY("data_APM4_shapeY/APM4_shapeY_beta="+beta+"_rho0="+rho0+"_epsilon="+epsilon+"_L="+L+"_t="+t+".txt");
+	fileShapeY.precision(6);
+	int Nexp=Ny;
+	for (real Y=-LY/2.;Y<LY/2.+LY/Nexp;Y+=LY/Nexp)
+	{
+		fileShapeY << Y << " " << R(0.,Y) << " " << RR(0.,Y) << " " << RL(0.,Y) << " " << RU(0.,Y) << " " << RD(0.,Y) << endl;
+	}
+	return 1;
+}
+
+///////////////////////////////////////
+/// INHOMOGENEOUS INITIAL CONDITION ///
+///////////////////////////////////////
+
+//Definition of the Heaviside function Theta.
+func real Theta(real X)
+{
+        if (X==0)
+        {
+                return 0.5;
+        }
+        else
+        {
+                return (abs(X)+X)/(2*X);
+        }
+}
+
+//Magnetization of the ordered phase.
+func real mag(real rho)
+{
+	real xi=1+(2*beta*J-1-r/rho)*alpha/(beta*J*beta*J);
+	if (xi<0)
+	{
+		return 0.;
+	}
+	else
+	{
+		return rho*beta*J/alpha*(1+sqrt(xi));
+	}	
+}
+
+//Take some arbitrary values of rhog and rhol such that rhog<rho0<rhol (for the initial condition).
+real rhog,rhol;
+if (mode==0)
+{
+	rhog=rho0-0.01;
+	rhol=rho0+0.01;
+}
+else if (mode==1)
+{
+	rhog=0.5;
+	rhol=2.5;
+}
+else if (mode==2)
+{
+	rhog=max(0.2,rho0-5);
+	rhol=rho0+5;
+}
+
+//Volume fraction of liquid (arbitrary).
+real Phi=(rho0-rhog)/(rhol-rhog);
+
+//Initial density profile.
+if (init==0)
+{
+	R=rhog+(rhol-rhog)*Theta(LX*Phi/2.-abs(x)); //y-independent initial condition (vertical band).
+}
+else if (init==1)
+{
+	R=rhog+(rhol-rhog)*Theta(LY*Phi/2.-abs(y)); //x-independent initial condition (horizontal band).
+}
+else if (init==2)
+{
+	real RPhi=sqrt(Phi*LX*LY);
+	R=rhog+(rhol-rhog)*Theta(RPhi*0.5-abs(x))*Theta(RPhi*0.5-abs(y)); //square of liquid inside the gas.
+}
+else if (init==3)
+{
+	real dH=0.02;
+	R=rhog+(rhol-rhog)*Theta(LX*Phi/2.+dH*LX*cos(2*pi*y/LY)-abs(x)); //quasi-vertical band with sinusoidal variation.
+}
+else if (init==4)
+{
+	real dH=0.02;
+	R=rhog+(rhol-rhog)*Theta(LY*Phi/2.+dH*LY*cos(2*pi*x/LX)-abs(y)); //quasi-horizontal band with sinusoidal variation.
+}
+
+//renormalization of R to have the correct average value.
+real norm=int2d(Th)(R)/int2d(Th)(1.);
+R=rho0*R/norm;
+
+//Ordered phase in the right state.
+Vh M0=mag(R);
+
+RR=0.25*(R+3*M0);
+RL=0.25*(R-M0);
+RU=0.25*(R-M0);
+RD=0.25*(R-M0);
+
+////////////////////////////////
+/// EQUATIONS OF THE PROBLEM ///
+////////////////////////////////
+
+//Definition of the I_{ji}.
+func real I(real RJ, real RI)
+{
+	return (4*beta*J*(RJ+RI)/R-1.-r/R-alpha*(RJ-RI)*(RJ-RI)/(R*R));
+}
+
+//Coupled equation to solve with periodic BC.
+//Definition of the APM problem as the sum of equations.
+/*problem dAPM4([rr,ru,rl,rd],[vr,vu,vl,vd],solver=sparsesolver)=
+	int2d(Th)(rr*vr + dt*(Dpara*dx(rr)*dx(vr) + Dperp*dy(rr)*dy(vr)) - v*dt*rr*dx(vr) - dt*(I(RR,RL)*(rr-rl) + I(RR,RU)*(rr-ru) + I(RR,RD)*(rr-rd))*vr
+		+ ru*vu + dt*(Dperp*dx(ru)*dx(vu) + Dpara*dy(ru)*dy(vu)) - v*dt*ru*dy(vu) - dt*(I(RU,RR)*(ru-rr) + I(RU,RL)*(ru-rl) + I(RU,RD)*(ru-rd))*vu
+		+ rl*vl + dt*(Dpara*dx(rl)*dx(vl) + Dperp*dy(rl)*dy(vl)) + v*dt*rl*dx(vl) - dt*(I(RL,RR)*(rl-rr) + I(RL,RU)*(rl-ru) + I(RL,RD)*(rl-rd))*vl		
+		+ rd*vd + dt*(Dperp*dx(rd)*dx(vd) + Dpara*dy(rd)*dy(vd)) + v*dt*rd*dy(vd) - dt*(I(RD,RR)*(rd-rr) + I(RD,RL)*(rd-rl) + I(RD,RU)*(rd-ru))*vd)
+	-int2d(Th)(RR*vr+RL*vl+RU*vu+RD*vd);*/
+
+//Definition of the APM problem with simplifications (gathering the corresponding terms: diffusion/self-propulsion/flip).
+problem dAPM4([rr,rl,ru,rd],[vr,vl,vu,vd],solver=sparsesolver)=
+	int2d(Th)(rr*vr + ru*vu + rl*vl + rd*vd	
+		+ dt*Dpara*(dx(rr)*dx(vr) + dy(ru)*dy(vu) + dx(rl)*dx(vl) + dy(rd)*dy(vd))
+		+ dt*Dperp*(dy(rr)*dy(vr) + dx(ru)*dx(vu) + dy(rl)*dy(vl) + dx(rd)*dx(vd))
+		- v*dt*(rr*dx(vr) + ru*dy(vu) - rl*dx(vl) - rd*dy(vd))
+		- dt*(Irl*(rr-rl)*(vr-vl) + Iru*(rr-ru)*(vr-vu) + Ird*(rr-rd)*(vr-vd) + Ilu*(rl-ru)*(vl-vu) + Ild*(rl-rd)*(vl-vd) + Iud*(ru-rd)*(vu-vd)))
+	- int2d(Th)(RR*vr + RU*vu + RL*vl + RD*vd);
+	
+//////////////////////
+/// TIME EVOLUTION ///
+//////////////////////
+
+int Nsteps=int(tmax/dt);
+int texp=0;
+int DT=int(1./dt);
+
+for(int t=0;t<=Nsteps+1;t+=1)
+{
+	if (t==texp)
+	{
+		if (init==0)
+		{
+			dataShapeX(t*dt);
+		}
+		else if (init==1)
+		{
+			dataShapeY(t*dt);
+		}
+		else
+		{
+			RPLOT=R;
+			dataFile("R",t*dt);
+			RPLOT=RR;
+			dataFile("RR",t*dt);
+			/*RPLOT=RU;
+			dataFile("RU",t*dt);
+			RPLOT=RL;
+			dataFile("RL",t*dt);
+			RPLOT=RD;
+			dataFile("RD",t*dt);*/
+		}
+		texp+=DT;
+		M0=(4*RR-R)/3.;
+		cout << "t=" << t*dt << " " << "N/V=" << int2d(Th)(R)/int2d(Th)(1.) << " Rmin=" << R[].min << " Rmax=" << R[].max << " Mmin=" << M0[].min << " Mmax=" << M0[].max << " -ctime=" << int(clock()-cpu) << "s" << endl;
+	}
+	
+	//Calculate the flipping terms (q(q-1)/2=6 terms).
+	Irl=I(RR,RL);
+	Iru=I(RR,RU);
+	Ird=I(RR,RD);
+	Ilu=I(RL,RU);
+	Ild=I(RL,RD);
+	Iud=I(RU,RD);
+	
+	//Solve APM equations.
+	dAPM4;
+	
+	//Replace the values of old functions.
+	RR=rr;	
+	RL=rl;
+	RU=ru;
+	RD=rd;
+	R=RR+RL+RU+RD;	
+}

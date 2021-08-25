@@ -1,0 +1,275 @@
+/* CODE IMPLEMENTED WITH FreeFem++ (documentation and free software available on https://freefem.org/)
+  6-STATE ACTIVE POTTS MODEL - BY M. MANGEAT & S. CHATTERJEE (2020)*/
+
+include "getARGV.idp" //Include parameters in command line.
+load "MUMPS" //Load a solver with less errors.
+
+//////////////////////////////
+/// PARAMETERS OF THE CODE ///
+//////////////////////////////
+
+//CPU clock time.
+real cpu=clock();
+
+//Physical parameters (beta=1/Temperature, rho0=N/V, epsilon= biased parameter, L=size of the box).
+real beta=getARGV("-beta",0.65);
+real rho0=getARGV("-rho0",1.5);
+real epsilon=getARGV("-epsilon",1.);
+real L=getARGV("-L",50);
+
+//Numerical parameters (dt=time increment, tmax=maximal time, N=number of verticles on the boundaries, init=geometry of initial condition, mode=initial value of rhog and rhol).
+real dt=getARGV("-dt",0.2);
+real tmax=getARGV("-tmax",1000);
+int N=getARGV("-N",100);
+int init=getARGV("-init",2); //2-> square of liquid inside the gas | 3-> quasi-vertical band | 4-> quasi-horizontal band.
+int mode=getARGV("-mode",1); //0-> linear stability (DRHO=0.02) | 1-> epsilon,rho0 diagram (const rhog,rhol) | 2-> T,rho0 diagram (non-const rhog,rhol).
+
+real D=1.,r=1., J=1.;
+real D1xx=1.5*D*(1+epsilon/5.);
+real D1yy=1.5*D*(1-epsilon/5.);
+real D2xx=1.5*D*(1-epsilon/10.);
+real D2yy=1.5*D*(1+epsilon/10.);
+real D2xy=3*sqrt(3)*D*epsilon/20.;
+real v=6*D*epsilon/5.;
+real alpha=18*beta*J*beta*J*(1-2*beta*J/3);
+
+//////////////////////////////
+/// CREATION OF THE DOMAIN ///
+//////////////////////////////
+
+//Definition of the mesh (centered in zero for convenience).
+
+real a=1./sqrt(3);
+border C1(t=0,L/2.){x=t; y=0; label=1;}
+border C2(t=L/2.,L){x=t; y=0; label=2;}
+border C3(t=0,sqrt(3)*L/2.){x=a*t+L; y=t; label=3;}
+border C4(t=3*L/2.,L){x=t; y=sqrt(3)*L/2.; label=4;}
+border C5(t=L,L/2.){x=t; y=sqrt(3)*L/2.; label=5;}
+border C6(t=sqrt(3)*L/2.,0){x=a*t; y=t; label=6;}
+
+mesh Th=buildmesh(C1(N/2)+C2(N/2)+C3(N)+C4(N/2)+C5(N/2)+C6(N));
+fespace Vh(Th,P1,periodic=[[1,x],[4,x-L],[3,y],[6,y],[2,x],[5,x]]); //periodic boundary condition.
+cout << "---MESH CREATED--- -ctime=" << int(clock()-cpu) << "s" << endl;
+
+//Functions defined on the mesh.
+Vh rho1,rho2,rho3,rho4,rho5,rho6; //Unknown functions at step n+1.
+Vh RHO,RHO1,RHO2,RHO3,RHO4,RHO5,RHO6; //Unkown functions at step n.
+Vh v1,v2,v3,v4,v5,v6; //Test-functions at step n+1.
+Vh I12,I13,I14,I15,I16,I23,I24,I25,I26,I34,I35,I36,I45,I46,I56; //Flipping terms.
+Vh RPLOT; //Function to plot
+
+//////////////////
+/// DATA FILES ///
+//////////////////
+
+func int dataFile(string name, real t)
+{
+	system("mkdir -p data_APM6diamond_init"+init+"/");
+	ofstream fileR("data_APM6diamond_init"+init+"/APM6diamond_"+name+"_beta="+beta+"_rho0="+rho0+"_epsilon="+epsilon+"_L="+L+"_t="+t+".txt");
+	fileR.precision(6);
+	int Nexp=max(N,200);
+	for (real Y=0;Y<=sqrt(3)*L/2.;Y+=0.5*sqrt(3)*L/Nexp)
+	{
+		for (real X=0;X<=1.5*L;X+=1.5*L/Nexp)
+		{
+			fileR << RPLOT(X,Y) << " ";
+		}
+		fileR << endl;
+	}
+	return 1;
+}
+
+///////////////////////////////////////
+/// INHOMOGENEOUS INITIAL CONDITION ///
+///////////////////////////////////////
+
+//Definition of the Heaviside function Theta.
+func real Theta(real X)
+{
+        if (X==0)
+        {
+                return 0.5;
+        }
+        else
+        {
+                return (abs(X)+X)/(2*X);
+        }
+}
+
+//Magnetization of the ordered phase.
+func real mag(real rho)
+{
+	real xi=1+(2*beta*J-1-r/rho)*alpha/(4*beta*J*beta*J);
+	if (xi<0)
+	{
+		return 0.;
+	}
+	else
+	{
+		return 2*rho*beta*J/alpha*(1+sqrt(xi));
+	}	
+}
+
+//Take some arbitrary values of rhog and rhol such that rhog<rho0<rhol (for the initial condition).
+real rhog,rhol;
+if (mode==0)
+{
+	rhog=rho0-0.01;
+	rhol=rho0+0.01;
+}
+else if (mode==1)
+{
+	rhog=0.5;
+	rhol=2.5;
+}
+else if (mode==2)
+{
+	rhog=max(0.2,rho0-5);
+	rhol=rho0+5;
+}
+
+//Volume fraction of liquid (arbitrary).
+real Phi=(rho0-rhog)/(rhol-rhog);
+
+if (init==0)
+{
+	real Rx=0.5*L*Phi;
+	if (Rx>L/4.)
+	{
+		Rx=3*L/4-L*sqrt((1-Phi)/2);
+	}
+	cout << Rx << " " << L/4. << endl;
+	RHO=rhog+(rhol-rhog)*Theta(Rx-abs(x-3*L/4.)); //y-independent initial condition (vertical band).
+}
+else if (init==1)
+{
+	real Ry=sqrt(3)*L*Phi/4.;
+	RHO=rhog+(rhol-rhog)*Theta(Ry-abs(y-L*sqrt(3)/4)); //x-independent initial condition (horizontal band).
+}
+else if (init==2)
+{
+	real Rx=0.5*L*sqrt(Phi);
+	real Ry=Rx*sqrt(3)/2.;
+	RHO=rhog+(rhol-rhog)*Theta(Ry-abs(y-L*sqrt(3)/4))*Theta(Rx-abs(x-L/2.-y/sqrt(3))); //diamond of liquid inside the gas.
+}
+else if (init==3)
+{
+	real Rx=0.5*L*Phi;
+	real dH=0.02*L;
+	if (Rx>L/4.)
+	{
+		Rx=3*L/4-L*sqrt((1-Phi)/2);
+	}
+	RHO=rhog+(rhol-rhog)*Theta(Rx-dH*cos(4*pi*y/(sqrt(3)*L))-abs(x-3*L/4.)); //quasi-vertical band with sinusoidal variation.
+}
+else if (init==4)
+{
+	real Ry=sqrt(3)*L*Phi/4.;
+	real dH=0.02*L;
+	RHO=rhog+(rhol-rhog)*Theta(Ry-dH*sin(2*pi*x/L)-abs(y-L*sqrt(3)/4)); //quasi-horizontal band with sinusoidal variation.
+}
+
+//renormalization of R to have the correct average value.
+real norm=int2d(Th)(RHO)/int2d(Th)(1.);
+RHO=rho0*RHO/norm;
+
+//Ordered phase in the right state.
+Vh M0=mag(RHO);
+
+RHO1=(RHO+5*M0)/6.;
+RHO2=(RHO-M0)/6.;
+RHO3=(RHO-M0)/6.;
+RHO4=(RHO-M0)/6.;
+RHO5=(RHO-M0)/6.;
+RHO6=(RHO-M0)/6.;
+
+////////////////////////////////
+/// EQUATIONS OF THE PROBLEM ///
+////////////////////////////////
+
+//Definition of the I_{ji}.
+func real I(real RHOJ, real RHOI)
+{
+	return 6*beta*J*(RHOJ+RHOI)/RHO-1.-r/RHO-alpha*(RHOJ-RHOI)*(RHOJ-RHOI)/(RHO*RHO);
+}
+
+//Coupled equation to solve with periodic BC.
+//Definition of the APM problem as the sum of equations, with simplifications (gathering the corresponding terms: diffusion/self-propulsion/flip).
+problem dAPM6([rho1,rho2,rho3,rho4,rho5,rho6],[v1,v2,v3,v4,v5,v6],solver=sparsesolver)=
+	int2d(Th)(rho1*v1 + rho2*v2 + rho3*v3 + rho4*v4 + rho5*v5 + rho6*v6	
+		+ dt*D1xx*(dx(rho1)*dx(v1) + dx(rho4)*dx(v4)) + dt*D2xx*(dx(rho2)*dx(v2) + dx(rho3)*dx(v3) + dx(rho5)*dx(v5) + dx(rho6)*dx(v6))
+		+ dt*D1yy*(dy(rho1)*dy(v1) + dy(rho4)*dy(v4)) + dt*D2yy*(dy(rho2)*dy(v2) + dy(rho3)*dy(v3) + dy(rho5)*dy(v5) + dy(rho6)*dy(v6))
+		+ dt*D2xy*(dx(rho2)*dy(v2) + dy(rho2)*dx(v2) - dx(rho3)*dy(v3) - dy(rho3)*dx(v3) + dx(rho5)*dy(v5) + dy(rho5)*dx(v5) - dx(rho6)*dy(v6) - dy(rho6)*dx(v6))
+		- v*dt*(rho1*dx(v1) + 0.5*rho2*(dx(v2) + sqrt(3)*dy(v2)) + 0.5*rho3*(-dx(v3) + sqrt(3)*dy(v3))
+		      - rho4*dx(v4) - 0.5*rho5*(dx(v5) + sqrt(3)*dy(v5)) - 0.5*rho6*(-dx(v6) + sqrt(3)*dy(v6)))
+		- dt*(I12*(rho1-rho2)*(v1-v2) + I13*(rho1-rho3)*(v1-v3) + I14*(rho1-rho4)*(v1-v4) + I15*(rho1-rho5)*(v1-v5) + I16*(rho1-rho6)*(v1-v6)
+		    + I23*(rho2-rho3)*(v2-v3) + I24*(rho2-rho4)*(v2-v4) + I25*(rho2-rho5)*(v2-v5) + I26*(rho2-rho6)*(v2-v6)
+		    + I34*(rho3-rho4)*(v3-v4) + I35*(rho3-rho5)*(v3-v5) + I36*(rho3-rho6)*(v3-v6)
+		    + I45*(rho4-rho5)*(v4-v5) + I46*(rho4-rho6)*(v4-v6)
+		    + I56*(rho5-rho6)*(v5-v6) ))
+	- int2d(Th)(RHO1*v1+RHO2*v2+RHO3*v3+RHO4*v4+RHO5*v5+RHO6*v6);
+	
+//////////////////////
+/// TIME EVOLUTION ///
+//////////////////////
+
+int Nsteps=int(tmax/dt);
+int texp=0;
+int DT=int(1./dt);
+
+for(int t=0;t<=Nsteps+1;t+=1)
+{
+	if (t==texp)
+	{
+		RPLOT=RHO;
+		dataFile("RHO",t*dt);
+		RPLOT=RHO1;
+		dataFile("RHO1",t*dt);
+		/*RPLOT=RHO2;
+		dataFile("RHO2",t*dt);
+		RPLOT=RHO3;
+		dataFile("RHO3",t*dt);
+		RPLOT=RHO4;
+		dataFile("RHO4",t*dt);
+		RPLOT=RHO5;
+		dataFile("RHO5",t*dt);
+		RPLOT=RHO6;
+		dataFile("RHO6",t*dt);*/		
+		texp+=DT;	
+		M0=(6*RHO1-RHO)/5.;
+		cout << "t=" << t*dt << " " << "N/V=" << int2d(Th)(RHO)/int2d(Th)(1.) << " Rmin=" << RHO[].min << " Rmax=" << RHO[].max << " Mmin=" << M0[].min << " Mmax=" << M0[].max << " -ctime=" << int(clock()-cpu) << "s" << endl;
+	}	
+	
+	//Calculate the flipping terms (q(q-1)/2=15 terms).
+	I12=I(RHO1,RHO2);
+	I13=I(RHO1,RHO3);
+	I14=I(RHO1,RHO4);
+	I15=I(RHO1,RHO5);
+	I16=I(RHO1,RHO6);
+	
+	I23=I(RHO2,RHO3);
+	I24=I(RHO2,RHO4);
+	I25=I(RHO2,RHO5);
+	I26=I(RHO2,RHO6);
+	
+	I34=I(RHO3,RHO4);
+	I35=I(RHO3,RHO5);
+	I36=I(RHO3,RHO6);
+	
+	I45=I(RHO4,RHO5);
+	I46=I(RHO4,RHO6);
+	
+	I56=I(RHO5,RHO6);
+	
+	//Solve APM equations.
+	dAPM6;
+	
+	//Replace the values of old functions.
+	RHO1=rho1;
+	RHO2=rho2;
+	RHO3=rho3;
+	RHO4=rho4;
+	RHO5=rho5;
+	RHO6=rho6;	
+	RHO=RHO1+RHO2+RHO3+RHO4+RHO5+RHO6;	
+}
