@@ -1,4 +1,4 @@
-# APM2020
+# Active Potts Model (2020)
 
 Codes used in the scientific publications:</br>
 [1] S. Chatterjee, M. Mangeat, R. Paul, and H. Rieger, <i><a href='https://iopscience.iop.org/article/10.1209/0295-5075/130/66001/meta'>Flocking and reorientation transition in the 4-state active Potts model</a></i>, EPL <b>130</b>, 66001 (2020).</br>
